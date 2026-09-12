@@ -11,7 +11,7 @@
 | `FightingGameMode.h/.cpp` | `Docs/Match.md` |
 | `FightingPlayerController.h/.cpp`、`FightingPlayerCharacter.h/.cpp` | `Docs/Player.md` |
 | `FightingCameraActor.h/.cpp` | `Docs/Camera.md` |
-| `FightingCpuSpawner.h/.cpp`、`FightingCpuCharacter.h/.cpp`、`FightingCpuController.h/.cpp` | `Docs/Cpu.md` |
+| `FightingCpuCharacter.h/.cpp`、`FightingCpuController.h/.cpp` | `Docs/Cpu.md` |
 
 下列變更必須同步更新功能文件：
 

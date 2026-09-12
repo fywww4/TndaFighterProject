@@ -7,17 +7,16 @@
 #include "FightingCameraActor.generated.h"
 
 class AFightingCpuCharacter;
-class APlayerController;
+class AFightingPlayerCharacter;
 class UCameraComponent;
 class USceneComponent;
 class USpringArmComponent;
-class UWidgetComponent;
 
 /**
  * 玩家與 CPU 共用的一對一格鬥攝影機。
  *
- * 初始化後先用黑幕與 Widget 隱藏啟動畫面，等場上同時存在玩家和最近的 CPU，才把自己
- * 設為 View Target。啟用後每幀追蹤兩人的水平軸與中點、平滑調整鏡頭距離，並限制玩家
+ * GameMode 在雙方定位後傳入角色，立即完成初始構圖與 SpringArm 插槽，才由 GameMode
+ * 設為 View Target。之後每幀追蹤兩人的水平軸與中點、平滑調整鏡頭距離，並限制玩家
  * 不得超出可構圖範圍。角色換邊時會選擇最接近目前 Yaw 的取景側，避免鏡頭翻轉 180 度。
  */
 UCLASS(BlueprintType)
@@ -30,45 +29,24 @@ public:
 	AFightingCameraActor();
 
 	/**
-	 * 指定擁有此攝影機與玩家角色的 Controller，並重新開始等待對手的啟動流程。
-	 * 呼叫後會立刻遮黑 3D 畫面、隱藏目前玩家 UI，並訂閱新 Actor 生成事件。
+	 * 在 GameMode 指定 View Target 前呼叫，以雙方實際位置直接套用初始構圖，不做插值。
+	 * 必須已完成 SpawnActor；角色無效時回傳 false，不進行初始化。
 	 */
-	void InitializeForController(APlayerController* InController);
-
-	/** 完成第一次雙人構圖並設為 View Target 後回傳 true，直到重新初始化為止。 */
-	bool IsCameraActive() const { return bCameraActive; }
+	bool InitializeForFighters(AFightingPlayerCharacter* InPlayer, AFightingCpuCharacter* InCpu);
 
 	/** 回傳目前 CameraComponent 的世界旋轉；元件無效時退回 Actor Rotation。 */
 	FRotator GetViewRotation() const;
 
 protected:
-	/** 在物理更新後限制玩家位置，接著更新雙人構圖與啟動遮罩狀態。 */
+	/** 在物理更新後限制玩家位置，接著更新雙人構圖；指定角色失效時停止更新。 */
 	virtual void Tick(float DeltaSeconds) override;
 
-	/** 解除 World Spawn 委派、黑幕與本攝影機隱藏的 UI，再結束 Actor 生命週期。 */
-	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-
 private:
-	/** 以最多每 0.25 秒一次的頻率，尋找距離玩家最近的有效 CPU。 */
-	void RefreshOpponent();
-
 	/**
 	 * 將玩家限制在 CPU 周圍 `MaxFighterDistance` 的水平圓形範圍內。
 	 * 超界時只移除向外的水平速度，保留向內、切線與垂直速度。
 	 */
 	void ConstrainPlayerToMaxDistance(AActor* PlayerActor, const AActor* OpponentActor) const;
-
-	/** 在新對手的 Screen-space UI 首次渲染前先將其隱藏。 */
-	void HandleActorSpawned(AActor* SpawnedActor);
-
-	/**
-	 * 固定攝影機就緒前，隱藏 Actor 身上目前可見的 WidgetComponent。
-	 * 只記錄原本可見的元件，避免稍後誤開其他系統刻意隱藏的 UI。
-	 */
-	void HideVisibleWidgetComponents(AActor* Actor);
-
-	/** 只恢復由本攝影機隱藏的 Actor UI。 */
-	void RestoreHiddenWidgetComponents();
 
 	/** 計算兩名角色中點，並把加上 `FocusHeight` 後的 Z 限制在初始焦點範圍內。 */
 	FVector GetDesiredFocusLocation(const AActor* PlayerActor, const AActor* OpponentActor) const;
@@ -96,21 +74,13 @@ private:
 	UPROPERTY(VisibleAnywhere, Category="Components")
 	TObjectPtr<UCameraComponent> FightingCamera;
 
-	/** 擁有 Viewport 與手動啟動遮罩的 Controller。 */
+	/** GameMode 指定的本機玩家；弱參照不延長角色生命週期。 */
 	UPROPERTY(Transient)
-	TWeakObjectPtr<APlayerController> OwningController;
+	TWeakObjectPtr<AFightingPlayerCharacter> Player;
 
-	/** 持續取景時選中的最近 CPU。 */
+	/** GameMode 指定的唯一 CPU，不自動搜尋替代對手。 */
 	UPROPERTY(Transient)
 	TWeakObjectPtr<AFightingCpuCharacter> Opponent;
-
-	/** 由本攝影機隱藏，因此可安全恢復的 UI 元件。 */
-	TArray<TWeakObjectPtr<UWidgetComponent>> HiddenWidgetComponents;
-
-	/**
-	 * 用於在新 CPU 首次渲染前遮住 UI 的 World Spawn 訂閱；EndPlay 或重新初始化時必須解除。
-	 */
-	FDelegateHandle ActorSpawnedHandle;
 
 	/** 攝影機焦點相對角色原點向上的高度。 */
 	UPROPERTY(EditAnywhere, Category="Fighting Camera", meta=(Units="cm"))
@@ -145,15 +115,6 @@ private:
 	/** 相對初始焦點允許追蹤的最大垂直偏移。 */
 	UPROPERTY(EditAnywhere, Category="Fighting Camera|Focus", meta=(ClampMin="0", Units="cm"))
 	float MaxVerticalFocusOffset = 250.0f;
-
-	/** 下次允許搜尋對手的世界時間，用來限制輪詢頻率。 */
-	float NextOpponentSearchTime = 0.0f;
-
-	/** 第一次取得玩家與 CPU、完成初始構圖並設定 View Target 後為 true。 */
-	bool bCameraActive = false;
-
-	/** 延後解除遮罩，直到格鬥 View Target 已完整渲染一幀。 */
-	bool bPendingFadeRelease = false;
 
 	/** 第一次完成構圖時的焦點高度，用來限制跳躍造成的垂直追蹤。 */
 	float InitialFocusZ = 0.0f;

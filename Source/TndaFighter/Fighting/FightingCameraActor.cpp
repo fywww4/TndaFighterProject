@@ -2,17 +2,12 @@
 
 #include "Fighting/FightingCameraActor.h"
 #include "Fighting/FightingCpuCharacter.h"
+#include "Fighting/FightingPlayerCharacter.h"
 #include "Camera/CameraComponent.h"
-#include "Camera/PlayerCameraManager.h"
 #include "Components/SceneComponent.h"
-#include "Components/WidgetComponent.h"
-#include "Engine/World.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
-#include "GameFramework/PlayerController.h"
 #include "GameFramework/SpringArmComponent.h"
-#include "Kismet/GameplayStatics.h"
-#include "TndaFighter.h"
 
 AFightingCameraActor::AFightingCameraActor()
 {
@@ -29,6 +24,8 @@ AFightingCameraActor::AFightingCameraActor()
 	CameraBoom->TargetArmLength = MinCameraDistance;
 	// 格鬥構圖優先於牆面避障，避免 SpringArm 因碰撞自動縮短而讓角色突然放大。
 	CameraBoom->bDoCollisionTest = false;
+	// SpringArm 必須使用本幀構圖結果，不能先於 Actor 更新而留下上一幀插槽。
+	CameraBoom->AddTickPrerequisiteActor(this);
 
 	FightingCamera = CreateDefaultSubobject<UCameraComponent>(TEXT("FightingCamera"));
 	FightingCamera->SetupAttachment(CameraBoom, USpringArmComponent::SocketName);
@@ -39,38 +36,31 @@ AFightingCameraActor::AFightingCameraActor()
 	FightingCamera->bConstrainAspectRatio = true;
 }
 
-void AFightingCameraActor::InitializeForController(APlayerController* InController)
+bool AFightingCameraActor::InitializeForFighters(AFightingPlayerCharacter* InPlayer, AFightingCpuCharacter* InCpu)
 {
-	// 重新初始化前先恢復上一個 Controller 可能留下的隱藏 UI。
-	RestoreHiddenWidgetComponents();
-	OwningController = InController;
-	Opponent.Reset();
-	// 這些狀態必須完整重設，否則重新初始化可能沿用上一場的搜尋節流或提早解除遮罩。
-	NextOpponentSearchTime = 0.0f;
-	bCameraActive = false;
-	bPendingFadeRelease = false;
-
-	if (UWorld* World = GetWorld())
+	if (!IsValid(InPlayer) || !IsValid(InCpu))
 	{
-		if (ActorSpawnedHandle.IsValid())
-		{
-			// Initialize 可能被重複呼叫；先移除舊 Handle，避免同一個 CPU 觸發多次回呼。
-			World->RemoveOnActorSpawnedHandler(ActorSpawnedHandle);
-		}
-
-		// Timer 可能在本 Actor 當幀 Tick 結束後才生成 CPU，因此必須在 Spawn Callback 內立即遮住 UI。
-		ActorSpawnedHandle = World->AddOnActorSpawnedHandler(
-			FOnActorSpawned::FDelegate::CreateUObject(this, &AFightingCameraActor::HandleActorSpawned));
+		return false;
 	}
+	Player = InPlayer;
+	Opponent = InCpu;
+	const FVector InitialFocusLocation = (InPlayer->GetActorLocation() + InCpu->GetActorLocation()) * 0.5f
+		+ FVector::UpVector * FocusHeight;
+	InitialFocusZ = InitialFocusLocation.Z;
+	SetActorLocation(InitialFocusLocation);
+	CameraBoom->SetRelativeRotation(FixedCameraRotation);
+	CameraBoom->SetRelativeRotation(GetDesiredCameraRotation(InPlayer, InCpu));
+	CameraBoom->TargetArmLength = GetDesiredCameraDistance(InPlayer, InCpu);
 
-	// Camera Fade 只會遮住 3D 場景，不會遮住 HP Bar 這類 Screen-space WidgetComponent。
-	if (InController && InController->PlayerCameraManager)
-	{
-		InController->PlayerCameraManager->SetManualCameraFade(1.0f, FLinearColor::Black, false);
-	}
-
-	// 玩家可能早於 World Spawn Callback 註冊完成前就已存在。
-	HideVisibleWidgetComponents(InController ? InController->GetPawn() : nullptr);
+	// 直接設定臂長不會更新插槽；首次同步計算且略過 Lag，避免 View Target 讀到註冊時的舊位置。
+	const bool bLocationLag = CameraBoom->bEnableCameraLag;
+	const bool bRotationLag = CameraBoom->bEnableCameraRotationLag;
+	CameraBoom->bEnableCameraLag = false;
+	CameraBoom->bEnableCameraRotationLag = false;
+	CameraBoom->TickComponent(0.0f, LEVELTICK_All, nullptr);
+	CameraBoom->bEnableCameraLag = bLocationLag;
+	CameraBoom->bEnableCameraRotationLag = bRotationLag;
+	return true;
 }
 
 FRotator AFightingCameraActor::GetViewRotation() const
@@ -81,82 +71,18 @@ FRotator AFightingCameraActor::GetViewRotation() const
 void AFightingCameraActor::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
-
-	APlayerController* PlayerController = OwningController.Get();
-	APawn* PlayerPawn = PlayerController ? PlayerController->GetPawn() : nullptr;
-	// Controller 或 Pawn 在關卡切換、死亡重生期間可能暫時失效；等待下一幀重新取得即可。
-	if (!IsValid(PlayerPawn))
+	AFightingPlayerCharacter* PlayerCharacter = Player.Get();
+	AFightingCpuCharacter* CpuCharacter = Opponent.Get();
+	// 本次對局只追蹤初始化時指定的角色；失效後停止更新，不搜尋替代對手。
+	if (!IsValid(PlayerCharacter) || !IsValid(CpuCharacter))
 	{
 		return;
 	}
-
-	// 等待 CPU 期間持續隱藏玩家的 Screen-space UI。
-	if (!bCameraActive)
-	{
-		HideVisibleWidgetComponents(PlayerPawn);
-	}
-
-	if (bPendingFadeRelease)
-	{
-		// 固定 View Target 已完整渲染一幀，此時才能同時顯示場景與角色 UI。
-		if (PlayerController->PlayerCameraManager)
-		{
-			PlayerController->PlayerCameraManager->SetManualCameraFade(0.0f, FLinearColor::Black, false);
-		}
-
-		RestoreHiddenWidgetComponents();
-		bPendingFadeRelease = false;
-	}
-
-	if (!Opponent.IsValid())
-	{
-		// 對手死亡或尚未生成時會重新搜尋；RefreshOpponent 內部另有限制查詢頻率。
-		RefreshOpponent();
-	}
-
-	AFightingCpuCharacter* CurrentOpponent = Opponent.Get();
-	if (!IsValid(CurrentOpponent))
-	{
-		return;
-	}
-
-	// 先修正玩家位置，再用修正後座標計算焦點、旋轉與距離，避免畫面落後一幀。
-	ConstrainPlayerToMaxDistance(PlayerPawn, CurrentOpponent);
-
-	if (!bCameraActive)
-	{
-		// 同時處理在 Spawn Callback 註冊前就已存在的對手。
-		HideVisibleWidgetComponents(CurrentOpponent);
-
-		const FVector InitialFocusLocation =
-			(PlayerPawn->GetActorLocation() + CurrentOpponent->GetActorLocation()) * 0.5f
-			+ FVector::UpVector * FocusHeight;
-		InitialFocusZ = InitialFocusLocation.Z;
-
-		// 首幀直接套用完整構圖，不做插值，避免從 Actor 預設位置或距離飛入。
-		SetActorLocation(InitialFocusLocation);
-		CameraBoom->SetRelativeRotation(GetDesiredCameraRotation(PlayerPawn, CurrentOpponent));
-		CameraBoom->TargetArmLength = GetDesiredCameraDistance(PlayerPawn, CurrentOpponent);
-		PlayerController->SetViewTarget(this);
-		if (PlayerController->PlayerCameraManager)
-		{
-			// 使用 Camera Cut 避免 View Target 插值短暫露出原本的第三人稱視角。
-			PlayerController->PlayerCameraManager->SetGameCameraCutThisFrame();
-		}
-
-		bCameraActive = true;
-		bPendingFadeRelease = true;
-
-		UE_LOG(LogTndaFighter, Log, TEXT("Fighting camera activated for %s and %s."),
-			*PlayerPawn->GetName(), *CurrentOpponent->GetName());
-		return;
-	}
-
-	// 焦點與旋轉不插值，才能讓雙方中點及其畫面水平線在每一幀都準確成立。
-	SetActorLocation(GetDesiredFocusLocation(PlayerPawn, CurrentOpponent));
-	CameraBoom->SetRelativeRotation(GetDesiredCameraRotation(PlayerPawn, CurrentOpponent));
+	ConstrainPlayerToMaxDistance(PlayerCharacter, CpuCharacter);
+	SetActorLocation(GetDesiredFocusLocation(PlayerCharacter, CpuCharacter));
+	CameraBoom->SetRelativeRotation(GetDesiredCameraRotation(PlayerCharacter, CpuCharacter));
 	CameraBoom->TargetArmLength = FMath::FInterpTo(
-		CameraBoom->TargetArmLength, GetDesiredCameraDistance(PlayerPawn, CurrentOpponent), DeltaSeconds, DistanceInterpolationSpeed);
+		CameraBoom->TargetArmLength, GetDesiredCameraDistance(PlayerCharacter, CpuCharacter), DeltaSeconds, DistanceInterpolationSpeed);
 }
 
 void AFightingCameraActor::ConstrainPlayerToMaxDistance(AActor* PlayerActor, const AActor* OpponentActor) const
@@ -192,69 +118,6 @@ void AFightingCameraActor::ConstrainPlayerToMaxDistance(AActor* PlayerActor, con
 			}
 		}
 	}
-}
-
-void AFightingCameraActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
-{
-	// 若未主動解除，World Delegate 的生命週期可能長於本 Actor。
-	if (UWorld* World = GetWorld(); World && ActorSpawnedHandle.IsValid())
-	{
-		World->RemoveOnActorSpawnedHandler(ActorSpawnedHandle);
-		ActorSpawnedHandle.Reset();
-	}
-
-	// EndPlay 可能發生在啟動期間，因此銷毀前要解除場景與 UI 兩種遮罩。
-	if (APlayerController* PlayerController = OwningController.Get();
-		PlayerController && PlayerController->PlayerCameraManager)
-	{
-		PlayerController->PlayerCameraManager->SetManualCameraFade(0.0f, FLinearColor::Black, false);
-	}
-
-	RestoreHiddenWidgetComponents();
-	Super::EndPlay(EndPlayReason);
-}
-
-void AFightingCameraActor::HandleActorSpawned(AActor* SpawnedActor)
-{
-	// UWorld 會在 Actor 完成生成後呼叫此函式，此時 Blueprint 建立的 WidgetComponent 已可取得。
-	if (IsValid(Cast<AFightingCpuCharacter>(SpawnedActor)))
-	{
-		HideVisibleWidgetComponents(SpawnedActor);
-	}
-}
-
-void AFightingCameraActor::HideVisibleWidgetComponents(AActor* Actor)
-{
-	if (!IsValid(Actor))
-	{
-		return;
-	}
-
-	TInlineComponentArray<UWidgetComponent*> WidgetComponents;
-	// TInlineComponentArray 避免為少量常見元件額外配置堆積記憶體。
-	Actor->GetComponents(WidgetComponents);
-	for (UWidgetComponent* WidgetComponent : WidgetComponents)
-	{
-		// 只記錄原本可見的元件，避免恢復時誤顯示其他遊戲狀態刻意隱藏的 UI。
-		if (IsValid(WidgetComponent) && WidgetComponent->IsVisible())
-		{
-			WidgetComponent->SetVisibility(false);
-			HiddenWidgetComponents.Add(WidgetComponent);
-		}
-	}
-}
-
-void AFightingCameraActor::RestoreHiddenWidgetComponents()
-{
-	for (const TWeakObjectPtr<UWidgetComponent>& WidgetComponent : HiddenWidgetComponents)
-	{
-		if (WidgetComponent.IsValid())
-		{
-			WidgetComponent->SetVisibility(true);
-		}
-	}
-
-	HiddenWidgetComponents.Reset();
 }
 
 FVector AFightingCameraActor::GetDesiredFocusLocation(const AActor* PlayerActor, const AActor* OpponentActor) const
@@ -299,44 +162,4 @@ float AFightingCameraActor::GetDesiredCameraDistance(const AActor* PlayerActor, 
 		FVector2D(MinFighterDistance, FMath::Max(MinFighterDistance + KINDA_SMALL_NUMBER, MaxFighterDistance)),
 		FVector2D(MinCameraDistance, FMath::Max(MinCameraDistance, MaxCameraDistance)),
 		FighterDistance);
-}
-
-void AFightingCameraActor::RefreshOpponent()
-{
-	UWorld* World = GetWorld();
-	APlayerController* PlayerController = OwningController.Get();
-	APawn* PlayerPawn = PlayerController ? PlayerController->GetPawn() : nullptr;
-	if (!World || !IsValid(PlayerPawn) || World->GetTimeSeconds() < NextOpponentSearchTime)
-	{
-		return;
-	}
-
-	// Timer 尚未完成 CPU 生成時，限制搜尋頻率。
-	NextOpponentSearchTime = World->GetTimeSeconds() + 0.25f;
-
-	TArray<AActor*> Enemies;
-	// 只搜尋 AFightingCpuCharacter 及其 Blueprint 子類，不會誤選場景中的其他 Pawn。
-	UGameplayStatics::GetAllActorsOfClass(World, AFightingCpuCharacter::StaticClass(), Enemies);
-
-	// 同時存在多名敵人時選最近者，確保固定攝影機的初始目標一致。
-	AFightingCpuCharacter* NearestEnemy = nullptr;
-	float NearestDistanceSquared = TNumericLimits<float>::Max();
-	for (AActor* EnemyActor : Enemies)
-	{
-		AFightingCpuCharacter* Enemy = Cast<AFightingCpuCharacter>(EnemyActor);
-		if (!IsValid(Enemy))
-		{
-			continue;
-		}
-
-		const float DistanceSquared = FVector::DistSquared2D(PlayerPawn->GetActorLocation(), Enemy->GetActorLocation());
-		if (DistanceSquared < NearestDistanceSquared)
-		{
-			NearestEnemy = Enemy;
-			NearestDistanceSquared = DistanceSquared;
-		}
-	}
-
-	Opponent = NearestEnemy;
-	// 沒有有效候選時保存空弱參照，下一個節流週期會繼續尋找。
 }

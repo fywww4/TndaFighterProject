@@ -21,7 +21,9 @@ public class TndaFighter : ModuleRules
 			"Slate"
 		});
 
-		PrivateDependencyModuleNames.AddRange(new string[] { });
+		PrivateDependencyModuleNames.AddRange(new string[] {
+			"AnimGraphRuntime"
+		});
 
 		if (Target.bBuildEditor)
 		{

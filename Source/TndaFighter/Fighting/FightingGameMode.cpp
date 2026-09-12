@@ -1,10 +1,15 @@
 // Copyright © 2026 USERJOY Technology Co., Ltd.All Rights Reserved.
 
-#include "Fighting/FightingGameMode.h"
-#include "Engine/World.h"
-#include "Kismet/GameplayStatics.h"
-#include "GameFramework/PlayerStart.h"
+#include "FightingGameMode.h"
+#include "FightingCameraActor.h"
+#include "FightingCpuCharacter.h"
+#include "FightingPlayerCharacter.h"
+#include "FightingPlayerController.h"
+#include "Camera/PlayerCameraManager.h"
 #include "Engine/PlayerStartPIE.h"
+#include "Engine/World.h"
+#include "GameFramework/PlayerStart.h"
+#include "Kismet/GameplayStatics.h"
 #include "TndaFighter.h"
 
 #if WITH_EDITOR
@@ -12,86 +17,152 @@
 #include "Misc/MessageDialog.h"
 #endif
 
-namespace
+APlayerStart* AFightingGameMode::FindSpawnPoint(FName StartTag)
 {
-	/**
-	 * 從世界中找出關卡內由設計師放置的 PlayerStart。
-	 *
-	 * 必須走 GetAllActorsOfClass 再逐一過濾，不能只用 GetActorOfClass：
-	 * Editor 在 PIE 且關卡沒有 PlayerStart 時，會自動注入 APlayerStartPIE
-	 * （繼承自 APlayerStart），GetActorOfClass 會誤判為有效出生點，導致 1P
-	 * 出現在視角附近而防呆永遠不觸發。
-	 */
-	APlayerStart* FindLevelPlayerStart(const UObject* WorldContextObject)
+	TArray<AActor*> PlayerStarts;
+	UGameplayStatics::GetAllActorsOfClass(this, APlayerStart::StaticClass(), PlayerStarts);
+	APlayerStart* Result = nullptr;
+	int32 MatchCount = 0;
+	for (AActor* Candidate : PlayerStarts)
 	{
-		TArray<AActor*> PlayerStarts;
-		UGameplayStatics::GetAllActorsOfClass(
-			WorldContextObject, APlayerStart::StaticClass(), PlayerStarts);
-
-		for (AActor* Candidate : PlayerStarts)
+		APlayerStart* Start = Cast<APlayerStart>(Candidate);
+		// PIE 的臨時出生點不屬於關卡配置；即使同名也不能掩蓋缺少出生點的錯誤。
+		if (IsValid(Start) && !Start->IsA<APlayerStartPIE>() && Start->PlayerStartTag == StartTag)
 		{
-			// 只接受關卡資產內的 APlayerStart；PIE 臨時 Actor 不列入 1P 出生點。
-			if (IsValid(Candidate) && !Candidate->IsA<APlayerStartPIE>())
-			{
-				return Cast<APlayerStart>(Candidate);
-			}
+			Result = Start;
+			++MatchCount;
 		}
+	}
 
+	if (MatchCount != 1)
+	{
+		ReportStartupError(FString::Printf(
+			TEXT("PlayerStartTag '%s' 必須恰有一個出生點，目前找到 %d 個。\n請放置 Player Start Actor，並設定 Player Start > Player Start Tag；Actor 顯示名稱不作為識別。"),
+			*StartTag.ToString(), MatchCount));
+		return nullptr;
+	}
+	return Result;
+}
+
+AActor* AFightingGameMode::FindPlayerStart_Implementation(AController* Player, const FString& IncomingName)
+{
+	if (bStartupFailed)
+	{
 		return nullptr;
 	}
 
-	/** 關卡缺少 PlayerStart 時的設計師提示；只在 1P 生成路徑呼叫，避免重複彈窗。 */
-	void ReportMissingPlayerStart(const AFightingGameMode* GameMode)
+	APlayerStart* PlayerStart = FindSpawnPoint(TEXT("PlayerStart"));
+	// 父類會先接受具名入口或 StartSpot 快取；在此統一驗證，避免那些路徑繞過固定出生規則。
+	return PlayerStart && FindSpawnPoint(TEXT("CpuStart")) ? PlayerStart : nullptr;
+}
+
+APawn* AFightingGameMode::SpawnDefaultPawnAtTransform_Implementation(AController* NewPlayer, const FTransform& SpawnTransform)
+{
+	return bStartupFailed ? nullptr : Super::SpawnDefaultPawnAtTransform_Implementation(NewPlayer, SpawnTransform);
+}
+
+void AFightingGameMode::FinishRestartPlayer(AController* NewPlayer, const FRotator& StartRotation)
+{
+	Super::FinishRestartPlayer(NewPlayer, StartRotation);
+	if (bStartupFailed || IsValid(CpuCharacter))
 	{
-		FString LevelName = TEXT("Unknown");
-		if (GameMode && GameMode->GetWorld())
+		return;
+	}
+
+	AFightingPlayerCharacter* PlayerCharacter = NewPlayer ? Cast<AFightingPlayerCharacter>(NewPlayer->GetPawn()) : nullptr;
+	if (!IsValid(PlayerCharacter))
+	{
+		ReportStartupError(TEXT("玩家初始化失敗：Default Pawn Class 必須為 FightingPlayerCharacter 子類，且已成功 Possess。"));
+		return;
+	}
+	APlayerStart* CpuStart = FindSpawnPoint(TEXT("CpuStart"));
+	if (!CpuStart)
+	{
+		return;
+	}
+	if (!IsValid(CpuClass) || CpuClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+	{
+		ReportStartupError(TEXT("Class Defaults > Fighting Match > Cpu Class 必須指定有效且非抽象的 FightingCpuCharacter 子類。"));
+		return;
+	}
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Owner = this;
+	// 延續原 CPU 出生的碰撞策略；構圖與朝向均使用調整後的位置。
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
+	CpuCharacter = GetWorld()->SpawnActor<AFightingCpuCharacter>(CpuClass, CpuStart->GetActorTransform(), SpawnParameters);
+	if (!IsValid(CpuCharacter))
+	{
+		ReportStartupError(TEXT("CPU 生成失敗，請檢查 Cpu Class 與 CpuStart 設定。"));
+		return;
+	}
+
+	FVector DirectionToCpu = CpuCharacter->GetActorLocation() - PlayerCharacter->GetActorLocation();
+	DirectionToCpu.Z = 0.0f;
+	// 出生點水平重合時保留原朝向，避免由零向量決定任意旋轉；不等待落地或額外 Tick。
+	if (!DirectionToCpu.IsNearlyZero())
+	{
+		PlayerCharacter->SetActorRotation(DirectionToCpu.Rotation());
+		CpuCharacter->SetActorRotation((-DirectionToCpu).Rotation());
+	}
+	UE_LOG(LogTndaFighter, Log, TEXT("Fighters positioned: %s and %s."), *PlayerCharacter->GetName(), *CpuCharacter->GetName());
+
+	AFightingPlayerController* PlayerController = Cast<AFightingPlayerController>(NewPlayer);
+	if (!PlayerController || !PlayerController->IsLocalPlayerController())
+	{
+		ReportStartupError(TEXT("Player Controller Class 必須為本機 FightingPlayerController 子類。"));
+		return;
+	}
+	UClass* CameraClass = FightingCameraClass ? FightingCameraClass.Get() : AFightingCameraActor::StaticClass();
+	if (CameraClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+	{
+		ReportStartupError(TEXT("Class Defaults > Fighting Match > Fighting Camera Class 必須為可生成的 FightingCameraActor 子類，或留空使用原生相機。"));
+		return;
+	}
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AFightingCameraActor* Camera = GetWorld()->SpawnActor<AFightingCameraActor>(CameraClass, FTransform::Identity, SpawnParameters);
+    if (IsValid(Camera))
+    {
+		// Player 跟 Cpu 都 Spawn 完成後才初始化相機，因為 FightingCameraActor 需要雙方角色的參考來計算構圖。
+        if (!Camera->InitializeForFighters(PlayerCharacter, CpuCharacter))
+        {
+            ReportStartupError(TEXT("格鬥相機初始化失敗，請檢查 Fighting Camera Class 與雙方角色。"));
+            return;
+        }
+
+		// 同步完成 SpringArm 插槽與 CameraComponent 的位置後才切換；Controller 已停用自動選鏡。
+		PlayerController->SetViewTarget(Camera);
+		if (PlayerController->PlayerCameraManager)
 		{
-			LevelName = GameMode->GetWorld()->GetMapName();
+            // 立即切換鏡頭，避免上一個鏡頭的殘影。
+			PlayerController->PlayerCameraManager->SetGameCameraCutThisFrame();
 		}
+    }
+	else {
+        ReportStartupError(TEXT("格鬥相機生成失敗，請檢查 Fighting Camera Class 設定。"));
+        return;
+	}
 
-		/*
-		 * MessageBox 會直接指出關卡與缺少的 Actor。
-		 *
-		 * 訊息會呈現為：
-		 *    關卡：stage1
-		 *    關卡設定錯誤：缺少 PlayerStart
-		 *
-		 *    請在關卡中放置一個 PlayerStart Actor（Place Actors > Basic > Player Start），
-		 *    作為 1P 玩家出生點。每個戰鬥擂台只允許放置一個 PlayerStart。
-		 */
-		const FString ErrorMessage = FString::Printf(
-			TEXT("關卡：%s\n關卡設定錯誤：缺少 PlayerStart\n\n請在關卡中放置一個 PlayerStart Actor（Place Actors > Basic > Player Start），作為 1P 玩家出生點。\n每個戰鬥擂台只允許放置一個 PlayerStart。"),
-			*LevelName);
-		UE_LOG(LogTndaFighter, Error, TEXT("%s"), *ErrorMessage);
+}
 
+void AFightingGameMode::ReportStartupError(const FString& Message)
+{
+	if (bStartupFailed)
+	{
+		return;
+	}
+	bStartupFailed = true;
+	FString BlueprintName = GetClass()->GetName();
+	BlueprintName.RemoveFromEnd(TEXT("_C"));
+	const FString ErrorMessage = FString::Printf(TEXT("關卡：%s\nGameMode：%s\n%s"),
+		*GetWorld()->GetMapName(), *BlueprintName, *Message);
+	UE_LOG(LogTndaFighter, Error, TEXT("%s"), *ErrorMessage);
 #if WITH_EDITOR
-		// 只在 Editor PIE 彈窗並結束 Play；打包版仍保留 Log 供 QA 追查。
-		if (GEditor && GameMode && GameMode->GetWorld() && GameMode->GetWorld()->WorldType == EWorldType::PIE)
-		{
-			FMessageDialog::Open(
-				EAppMsgCategory::Error,
-				EAppMsgType::Ok,
-				EAppReturnType::Ok,
-				FText::FromString(ErrorMessage),
-				NSLOCTEXT("FightingGameMode", "MissingPlayerStartTitle", "玩家出生點設定錯誤"));
-			GEditor->RequestEndPlayMap();
-		}
-#endif
-	}
-}
-
-AActor* AFightingGameMode::ChoosePlayerStart_Implementation(AController* Player)
-{
-	if (APlayerStart* PlayerStart = FindPlayerSpawnPoint())
+	if (GEditor && GetWorld()->WorldType == EWorldType::PIE)
 	{
-		return PlayerStart;
+		FMessageDialog::Open(EAppMsgCategory::Error, EAppMsgType::Ok, EAppReturnType::Ok,
+			FText::FromString(ErrorMessage), NSLOCTEXT("FightingGameMode", "StartupErrorTitle", "對局初始化設定錯誤"));
+		GEditor->RequestEndPlayMap();
 	}
-
-	ReportMissingPlayerStart(this);
-	return nullptr;
-}
-
-APlayerStart* AFightingGameMode::FindPlayerSpawnPoint() const
-{
-	return FindLevelPlayerStart(this);
+#endif
 }

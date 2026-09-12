@@ -33,7 +33,7 @@ void AFightingPlayerCharacter::DoMove(float Right, float Forward)
 {
 	if (GetController() != nullptr)
 	{
-		// 共用攝影機尚未取得兩名角色時，先沿用 Controller 旋轉作為移動基準。
+		// View Target 不是有效格鬥攝影機時，沿用 Controller 旋轉作為移動基準。
 		FRotator Rotation = GetController()->GetControlRotation();
 		if (const AFightingPlayerController* PlayerController = Cast<AFightingPlayerController>(GetController()))
 		{

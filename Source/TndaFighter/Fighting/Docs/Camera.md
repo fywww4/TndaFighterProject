@@ -2,19 +2,19 @@
 
 ## 責任
 
-`AFightingCameraActor` 提供玩家與 CPU 共用的一對一格鬥視角。它負責選取對手、追蹤雙方構圖、限制最大水平間距，以及管理格鬥視角啟用前的場景與角色 UI 遮罩。
+`AFightingCameraActor` 提供玩家與 CPU 共用的一對一格鬥視角。它接收 GameMode 指定的玩家與 CPU，負責初始構圖、後續追蹤與玩家最大水平間距。
 
 原始碼：`FightingCameraActor.h`、`FightingCameraActor.cpp`
 
 ## 建立與啟用
 
-`AFightingPlayerController` 會為本機玩家建立一個 `AFightingCameraActor`。若要在 Blueprint 調整構圖參數，可建立其子類並指定給 PlayerController 的 `FightingCameraClass`；未指定時使用原生 C++ 類別。
+`AFightingGameMode` 在雙方生成及初始朝向完成後建立一個 `AFightingCameraActor`，Owner 為 GameMode，隨關卡世界結束清除。若要在 Blueprint 調整構圖參數，可建立相機子類並指定給 GameMode 的 `Fighting Match > FightingCameraClass`；未指定時使用原生 C++ 類別。
 
-攝影機初始化後會尋找離玩家最近的 `AFightingCpuCharacter` 或其 Blueprint 子類。玩家與 CPU 都有效時，攝影機先以雙方初始中點完成構圖，再將自己設為 View Target。
+`InitializeForFighters(Player, Cpu)` 只接受已生成的有效角色。它以出生碰撞調整後的實際位置設定焦點、初始高度、旋轉與臂長；首次不插值。直接修改臂長不會更新 SpringArm 插槽，因此初始化會暫時略過 SpringArm Lag，同步更新一次插槽及 CameraComponent，再由 GameMode 指定 View Target 與 Camera Cut。
 
 ## 雙人構圖
 
-攝影機在 `PostPhysics` Tick，每幀依角色完成移動與物理更新後的位置執行下列工作：
+攝影機在 `PostPhysics` Tick，SpringArm 以 Actor Tick 為前置條件，使用同幀更新後的構圖。每幀依角色完成移動與物理更新後的位置執行下列工作：
 
 - 精確追蹤玩家與 CPU 的世界座標中點。
 - 讓鏡頭 Yaw 與雙方水平連線保持垂直，使兩名角色在畫面上的站位線維持水平。
@@ -48,10 +48,8 @@ FOV 固定為 `55°`。SpringArm Collision Test 保持關閉，避免場景碰�
 
 `AFightingPlayerCharacter` 會向 PlayerController 查詢實際攝影機旋轉，作為相對畫面的移動方向。輸入與動畫行為記錄於 [玩家模組](Player.md)。
 
-## 啟動遮罩與角色 UI
+## 生命週期與首幀
 
-CPU 尚未生成、攝影機無法計算中點時，PlayerCameraManager 會保持黑色遮罩。攝影機也會暫時隱藏玩家與 CPU 身上的可見 Screen-space WidgetComponent，目前包含 HP Bar。
+GameMode 在雙方定位後同步完成相機初始化，Controller 停用自動管理 View Target。沒有搜尋、輪詢、World Spawn 委派、啟動黑幕、Widget 隱藏／恢復或延後解除遮罩；角色 UI 保持原本的可見設定。
 
-新生成的 `AFightingCpuCharacter` 會透過 World Actor Spawn 通知，在同一次 Spawn 流程中隱藏 UI，不等待下一幀 Tick。格鬥攝影機成為 View Target 並完整渲染一幀後，才解除場景遮罩並恢復由本攝影機隱藏的角色 UI，避免啟動時短暫顯示原本的第三人稱鏡頭或 HP Bar。
-
-攝影機啟用後保持 Tick；CPU 失效時會以最多每 `0.25` 秒一次的頻率重新尋找最近對手。攝影機結束生命週期時會解除 World Spawn 委派、黑色遮罩與尚未恢復的角色 UI。
+相機保存雙方弱參照，任何一方失效時停止更新，不搜尋替代對手，也不處理角色生成、重生或回合重置。
